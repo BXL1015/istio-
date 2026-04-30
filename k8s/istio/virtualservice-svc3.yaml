@@ -1,0 +1,20 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: svc3
+spec:
+  hosts:
+    - svc3
+  http:
+    - match:
+        - headers:
+            x-env:
+              exact: set1
+      route:
+        - destination:
+            host: svc3
+            subset: set1
+    - route:
+        - destination:
+            host: svc3
+            subset: baseline

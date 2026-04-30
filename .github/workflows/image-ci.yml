@@ -1,0 +1,121 @@
+name: 构建并推送容器镜像
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "要构建的服务 (逗号分隔, 例如: svc3,svc5)。留空则自动检测变更的服务"
+        required: false
+        type: string
+      image_tag:
+        description: "镜像标签覆盖 (留空则使用分支名+SHA)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 运行测试
+        run: go test ./...
+
+      - name: 检测变更的服务
+        id: detect
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          explicit_tag="${{ inputs.image_tag }}"
+          override="${{ inputs.services }}"
+          
+          if [[ -n "$explicit_tag" ]]; then
+            tag="$explicit_tag"
+          else
+            tag="${GITHUB_REF_NAME}-${short_sha}"
+          fi
+          
+          if [[ -n "$override" ]]; then
+            programs="$(echo "$override" | tr ',' ' ')"
+          else
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              base="HEAD^"
+            else
+              base="$(git hash-object -t tree /dev/null)"
+            fi
+            
+            changed="$(git diff --name-only "$base" HEAD)"
+            programs=""
+            
+            if echo "$changed" | grep -qE '^(internal/|go\.mod$|Dockerfile$)'; then
+              programs="svc1 svc2 svc3 svc4 svc5 svc6 svc7 svc8 svc9 svc10 svc11 svc12 svc13 svc14 svc15"
+            else
+              for svc in svc1 svc2 svc3 svc4 svc5 svc6 svc7 svc8 svc9 svc10 svc11 svc12 svc13 svc14 svc15; do
+                if echo "$changed" | grep -qE "^${svc}/"; then
+                  programs="$programs $svc"
+                fi
+              done
+            fi
+          fi
+          
+          programs="$(echo $programs)"
+          
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "programs=$programs" >> $GITHUB_OUTPUT
+
+      - name: Setup Docker Buildx
+        if: steps.detect.outputs.programs != ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        if: steps.detect.outputs.programs != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送镜像
+        if: steps.detect.outputs.programs != ''
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          tag="${{ steps.detect.outputs.tag }}"
+          
+          for svc in ${{ steps.detect.outputs.programs }}; do
+            image="ghcr.io/${owner}/gitops-lane-${svc}"
+            echo "正在构建 $svc -> $image:$tag"
+            
+            docker buildx build \
+              --push \
+              --platform linux/amd64 \
+              --build-arg "APP=$svc" \
+              -t "${image}:${tag}" \
+              -t "${image}:${GITHUB_REF_NAME}" \
+              .
+          done
+
+      - name: 输出摘要
+        if: steps.detect.outputs.programs != ''
+        shell: bash
+        run: |
+          echo "## 镜像构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像标签:** ${{ steps.detect.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**构建服务:** ${{ steps.detect.outputs.programs }}" >> $GITHUB_STEP_SUMMARY

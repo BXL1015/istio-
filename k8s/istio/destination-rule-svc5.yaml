@@ -1,0 +1,16 @@
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: svc5
+spec:
+  host: svc5
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+    - name: baseline
+      labels:
+        env: baseline
+    - name: set1
+      labels:
+        env: set1

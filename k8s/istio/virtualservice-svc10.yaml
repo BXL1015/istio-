@@ -1,0 +1,12 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: svc10
+spec:
+  hosts:
+    - svc10
+  http:
+    - route:
+        - destination:
+            host: svc10
+            subset: baseline

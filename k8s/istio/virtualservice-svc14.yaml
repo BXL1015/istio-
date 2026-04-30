@@ -1,0 +1,12 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: svc14
+spec:
+  hosts:
+    - svc14
+  http:
+    - route:
+        - destination:
+            host: svc14
+            subset: baseline

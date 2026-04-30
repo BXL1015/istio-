@@ -1,0 +1,323 @@
+name: 创建泳道环境
+
+on:
+  workflow_dispatch:
+    inputs:
+      swimlane_name:
+        description: "泳道名称 (例如: set1, set2, feature-101)"
+        required: true
+        type: string
+      services:
+        description: "要部署的服务 (逗号分隔, 例如: svc3,svc5,svc7)"
+        required: true
+        type: string
+      image_tag:
+        description: "镜像标签 (留空默认使用 main)"
+        required: false
+        type: string
+        default: "main"
+      overwrite:
+        description: "是否覆盖已存在的泳道"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-swimlane:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 验证输入参数
+        shell: bash
+        run: |
+          set -e
+          
+          swimlane="${{ inputs.swimlane_name }}"
+          services="${{ inputs.services }}"
+          
+          if [[ ! "$swimlane" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "泳道名称格式错误，请使用小写字母、数字和连字符"
+            exit 1
+          fi
+          
+          if [[ "$swimlane" == "baseline" ]]; then
+            echo "不能使用 'baseline' 作为泳道名称"
+            exit 1
+          fi
+          
+          IFS=',' read -ra svc_array <<< "$services"
+          valid_services="svc1 svc2 svc3 svc4 svc5 svc6 svc7 svc8 svc9 svc10 svc11 svc12 svc13 svc14 svc15"
+          
+          for svc in "${svc_array[@]}"; do
+            svc=$(echo "$svc" | tr -d ' ')
+            if [[ ! " $valid_services " =~ " $svc " ]]; then
+              echo "无效的服务名称: $svc"
+              exit 1
+            fi
+          done
+
+      - name: 生成泳道 Deployment
+        shell: bash
+        run: |
+          set -e
+          
+          swimlane="${{ inputs.swimlane_name }}"
+          services="${{ inputs.services }}"
+          image_tag="${{ inputs.image_tag }}"
+          overwrite="${{ inputs.overwrite }}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          
+          target_dir="k8s/swimlanes/$swimlane"
+          
+          if [[ -d "$target_dir" ]] && [[ "$overwrite" != "true" ]]; then
+            echo "泳道已存在，请设置 overwrite=true 来覆盖"
+            exit 1
+          fi
+          
+          if [[ -d "$target_dir" ]] && [[ "$overwrite" == "true" ]]; then
+            rm -rf "$target_dir"
+          fi
+          
+          mkdir -p "$target_dir"
+          
+          IFS=',' read -ra svc_array <<< "$services"
+          
+          for svc in "${svc_array[@]}"; do
+            svc=$(echo "$svc" | tr -d ' ')
+            
+            cat > "$target_dir/$svc.yaml" << EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: $svc-$swimlane
+            labels:
+              app: $svc
+              env: $swimlane
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: $svc
+                env: $swimlane
+            template:
+              metadata:
+                labels:
+                  app: $svc
+                  env: $swimlane
+              spec:
+                containers:
+                  - name: $svc
+                    image: ghcr.io/$owner/gitops-lane-$svc:$image_tag
+                    imagePullPolicy: Always
+                    env:
+                      - name: SERVICE_NAME
+                        value: $svc
+                      - name: SERVICE_ENV
+                        value: $swimlane
+                    resources:
+                      limits:
+                        memory: 128Mi
+                      requests:
+                        memory: 64Mi
+                    ports:
+                      - name: http
+                        containerPort: 9000
+          EOF
+            
+            echo "已创建: $target_dir/$svc.yaml"
+          done
+          
+          cat > "$target_dir/README.md" << EOF
+          # 泳道: $swimlane
+          
+          ## 服务列表
+          
+          $(for svc in "${svc_array[@]}"; do echo "- $(echo $svc | tr -d ' ')"; done)
+          
+          ## 使用方式
+          
+          \`\`\`bash
+          curl -H "x-env: $swimlane" http://<svc1-ip>:9000/?n=10
+          \`\`\`
+          
+          ## 镜像标签
+          
+          \`\`\`
+          $image_tag
+          \`\`\`
+          EOF
+
+      - name: Patch Istio DestinationRule
+        shell: bash
+        run: |
+          set -e
+          
+          swimlane="${{ inputs.swimlane_name }}"
+          services="${{ inputs.services }}"
+          
+          IFS=',' read -ra svc_array <<< "$services"
+          
+          for svc in "${svc_array[@]}"; do
+            svc=$(echo "$svc" | tr -d ' ')
+            dr_file="k8s/istio/destination-rule-$svc.yaml"
+            
+            if [[ ! -f "$dr_file" ]]; then
+              echo "DestinationRule 文件不存在: $dr_file"
+              exit 1
+            fi
+            
+            # 检查 subset 是否已存在
+            if grep -q "name: $swimlane" "$dr_file"; then
+              echo "Subset '$swimlane' 已存在于 $dr_file，跳过"
+              continue
+            fi
+            
+            # 在 subsets 数组中添加新的 subset
+            python3 - "$dr_file" "$swimlane" << 'PY'
+          import yaml
+          import sys
+          
+          file_path = sys.argv[1]
+          swimlane = sys.argv[2]
+          
+          with open(file_path, 'r', encoding='utf-8') as f:
+              data = yaml.safe_load(f)
+          
+          new_subset = {
+              'name': swimlane,
+              'labels': {
+                  'env': swimlane
+              }
+          }
+          
+          if 'subsets' not in data['spec']:
+              data['spec']['subsets'] = []
+          
+          data['spec']['subsets'].append(new_subset)
+          
+          with open(file_path, 'w', encoding='utf-8') as f:
+              yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+          
+          print(f"已添加 subset '{swimlane}' 到 {file_path}")
+          PY
+            
+            echo "已 Patch: $dr_file"
+          done
+
+      - name: Patch Istio VirtualService
+        shell: bash
+        run: |
+          set -e
+          
+          swimlane="${{ inputs.swimlane_name }}"
+          services="${{ inputs.services }}"
+          
+          IFS=',' read -ra svc_array <<< "$services"
+          
+          for svc in "${svc_array[@]}"; do
+            svc=$(echo "$svc" | tr -d ' ')
+            vs_file="k8s/istio/virtualservice-$svc.yaml"
+            
+            if [[ ! -f "$vs_file" ]]; then
+              echo "VirtualService 文件不存在: $vs_file"
+              exit 1
+            fi
+            
+            # 检查 route 是否已存在
+            if grep -q "exact: $swimlane" "$vs_file"; then
+              echo "Route for '$swimlane' 已存在于 $vs_file，跳过"
+              continue
+            fi
+            
+            # 在 http 数组开头添加新的 match/route
+            python3 - "$vs_file" "$swimlane" "$svc" << 'PY'
+          import yaml
+          import sys
+          
+          file_path = sys.argv[1]
+          swimlane = sys.argv[2]
+          svc = sys.argv[3]
+          
+          with open(file_path, 'r', encoding='utf-8') as f:
+              data = yaml.safe_load(f)
+          
+          new_route = {
+              'match': [
+                  {
+                      'headers': {
+                          'x-env': {
+                              'exact': swimlane
+                          }
+                      }
+                  }
+              ],
+              'route': [
+                  {
+                      'destination': {
+                          'host': svc,
+                          'subset': swimlane
+                      }
+                  }
+              ]
+          }
+          
+          if 'http' not in data['spec']:
+              data['spec']['http'] = []
+          
+          # 插入到数组开头（最高优先级）
+          data['spec']['http'].insert(0, new_route)
+          
+          with open(file_path, 'w', encoding='utf-8') as f:
+              yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+          
+          print(f"已添加 route for '{swimlane}' 到 {file_path}")
+          PY
+            
+            echo "已 Patch: $vs_file"
+          done
+
+      - name: 提交变更
+        shell: bash
+        run: |
+          if git diff --quiet -- k8s; then
+            echo "没有变更需要提交"
+            exit 0
+          fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add k8s
+          git commit -m "创建泳道: ${{ inputs.swimlane_name }}"
+          git push
+
+      - name: 输出摘要
+        shell: bash
+        run: |
+          echo "## 泳道创建成功" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**泳道名称:** ${{ inputs.swimlane_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**服务列表:** ${{ inputs.services }}" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像标签:** ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 已更新的文件" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:**" >> $GITHUB_STEP_SUMMARY
+          IFS=',' read -ra svc_array <<< "${{ inputs.services }}"
+          for svc in "${svc_array[@]}"; do
+            svc=$(echo "$svc" | tr -d ' ')
+            echo "- k8s/swimlanes/${{ inputs.swimlane_name }}/$svc.yaml" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Istio 配置:**" >> $GITHUB_STEP_SUMMARY
+          for svc in "${svc_array[@]}"; do
+            svc=$(echo "$svc" | tr -d ' ')
+            echo "- k8s/istio/destination-rule-$svc.yaml" >> $GITHUB_STEP_SUMMARY
+            echo "- k8s/istio/virtualservice-$svc.yaml" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ArgoCD 将自动同步并部署新的泳道环境" >> $GITHUB_STEP_SUMMARY
